@@ -1,0 +1,1065 @@
+
+* BioMe CNV Pipeline | PennCNV Calling | Step 0 | README
+
+#+NAME: readme
+#+BEGIN_SRC elisp
+ 
+----------------------------
+PENNCNV DOCUMENTATION
+----------------------------
+  - http://penncnv.openbioinformatics.org/en/latest/user-guide/input/#overview-of-input-file-formats
+  - Input files 
+      + signal intensity file
+      + HMM file
+      + PFB file
+      + optionally a GCModel file. 
+  - users prepare the signal intensity files in the correct formats
+  - all other files are bundled in the PennCNV package already (but doug says make your own to match your platform)
+  - PennCNV will only process markers in the signal intensity file that are annotated in the PFB file (hence why make your own PFB file)
+  - Excample PFB: /hpc/packages/minerva-centos7/penncnv/1.0.5/PennCNV-1.0.5/lib/Merged_PFB_hg19.pfb   
+
+---------------------------
+BioMe files for PENNCNV
+---------------------------
+
+- Someone had already made the signal intensity files perfectly formatted for PENNCNV (makes me wonder if someone has already run it, but Simon from IPM doesn't know)
+- Those files are at: /sc/private/regen/data/Regeneron/SINAI_Freeze_Two_pVCF/data/GSA_CHIP/signalFiles
+- I temporarily copied them to minerva directory with more space (will delete once CNVs are called)
+- These files do not have information about snp chromosome or position
+- There is a file I am using for that at: /sc/private/regen/data/Regeneron/SINAI_Freeze_Two_pVCF/data/GSA_CHIP/resources/GSA-24v1-0_A1.csv
+- I haven't confirmed with anyone in IPM that this is the right file to use, but it has the right number of rows and whatnot so going with it
+- we can see that all of the signal intensity files have 642825 rows
+- knowing this, we can make a file Name|Chr|Pos (penncnv calls this the 'snpposfile') that is needed to make the PFB file
+- per https://github.com/WGLab/PennCNV/issues/22 the hhall.hmm file that comes with penncnv can be used for any illumina array, nothing special for us to do here
+- confirmed further here https://github.com/WGLab/PennCNV/issues/13 that this file is ok specifically for gsa
+- this hmm file for us is at /hpc/packages/minerva-centos7/penncnv/1.0.5/PennCNV-1.0.5/lib/hhall.hmm
+
+#+END_SRC
+
+
+* BioMe CNV Pipeline | PennCNV Calling | Step 1 - unzip intensity files
+
+#+NAME: unzip_intensity_files
+#+BEGIN_SRC shell
+## in shell
+
+# setup
+  ml penncnv/1.0.5
+  dir=/sc/arion/projects/psychgen2/scratch/tmp_biome_gsa_intensity/gsa_intensity
+  scr=/sc/arion/projects/H_rg_psychgen/scratch
+  fls=/sc/arion/projects/H_rg_psychgen/files/gsa_signal_intensity_filelist
+  ref=${dir}/GSA-24v1-0_A1.csv
+
+# unzip intensity files
+  find ${dir}/ -wholename "*gz" > ${fls}
+  split -d -a4 -l100 $fls ${dir}/TMP_flist_
+  for i in `ls ${dir}/TMP_flist_????`
+  do
+    awk '{print "gunzip", $0}' ${i} > x
+    mv x ${i}.sh
+    mybsub psychgen `basename ${i}` 1000 0:10 private 1 "sh ${i}.sh"
+  done
+  ##
+  ## check 
+  ##
+  grep Success ${dir}/TMP_flist_????.stdout | wc -l #325
+  ls ${dir}/TMP_flist_????.stdout | wc -l #325
+  ##
+  ## clean up 
+  ##
+  rm ${dir}/TMP_flist_????*
+
+# list the unzipped files
+  find ${dir}/ -wholename "*txt" > ${fls}_unzipped
+
+# check nrows in signal intensity files
+  cat ${fls}_unzipped | xargs wc -l > ${dir}/TMP_wcl
+  grep total -v ${dir}/TMP_wcl | awk '{print $1}' | sort | uniq -c 
+  ##32595 642825
+
+# list missing sites 
+  cat ${fls}_unzipped | xargs fgrep "nan" > ${scr}/missingsites
+  awk -F":" '{print $2}' ${scr}/missingsites | awk '{print $1}' | sort | uniq > ${scr}/badguys
+  ## can see from size of this file that most sites have >=1 missing value, so we cant filter them out before making pfb file (not clear we want to, thought it might be cleaner, but no)
+
+## Output of this step: /sc/arion/projects/H_rg_psychgen/files/gsa_signal_intensity_filelist_unzipped
+#+END_SRC
+
+
+* BioMe CNV Pipeline | PennCNV Calling | Step 2 - make "snpposfile"  
+
+#+NAME: make_snpposfile
+#+BEGIN_SRC R
+## in R
+
+# setup
+  library(data.table)
+  setwd("/sc/arion/projects/psychgen2/scratch/tmp_biome_gsa_intensity/gsa_intensity")
+
+# read in the file with marker info
+  ref <- fread("GSA-24v1-0_A1.csv", skip=7, sep=",", fill=T, na=c("NA",""))
+
+# read in representative signal intensity file
+  sig <- fread("SINAI_50674_AB46434027.201700450064_R11C01.signal.txt")
+
+# some sanity checks
+  nrow(sig) #[1] 642824
+  nrow(ref) #[1] 642848
+  uniqueN(sig$Name) #[1] 642824
+  uniqueN(ref$Name) #[1] 642833
+  uniqueN(ref[Name %in% sig$Name]$Name) #[1] 642824 ... ok, good, the are some extra rows in ref but all the rows in sig are there so we are set
+
+# make snpposfile
+  dout <- ref[Name %in% sig$Name,.(Name, Chr, Pos=MapInfo)]
+  fout <- "GSA-24v1-0_A1_snpposfile.tsv"
+  fwrite(dout, row=F, col=T, quo=F, sep='\t', file=fout)
+
+## Output of this step: /sc/arion/projects/psychgen2/scratch/tmp_biome_gsa_intensity/gsa_intensity/GSA-24v1-0_A1_snpposfile.tsv
+#+END_SRC
+
+
+* BioMe CNV Pipeline | PennCNV Calling | Step 3 - make "pfb" file
+
+#+NAME: make_pfb_file
+#+BEGIN_SRC shell
+## in shell
+
+# setup
+  ml purge 
+  ml penncnv/1.0.5
+  snp=/sc/arion/projects/psychgen2/scratch/tmp_biome_gsa_intensity/gsa_intensity/GSA-24v1-0_A1_snpposfile.tsv
+  fls=/sc/arion/projects/H_rg_psychgen/files/gsa_signal_intensity_filelist_unzipped
+  scr=/sc/arion/projects/H_rg_psychgen/scratch
+  pfb=/sc/arion/projects/H_rg_psychgen/files/GSA-24v1-0_A1.pfb 
+
+# test 
+  head ${fls} > ${scr}/tmp
+  compile_pfb.pl  --listfile ${scr}/tmp --snpposfile ${snp}
+
+# make
+  compile_pfb.pl  --listfile ${fls} --snpposfile ${snp} > ${pfb} &
+
+# what are the warnings? "WARNING: the BAF value (nan) in file SINAI_48642_AB45094179.201490080031_R01C01.signal.txt is not a valid number in input line: <GSA-rs117812448 nan     nan>"
+  ## manual inspection shows that some rows in each file have 'nan' values
+  ## hopefully the pfb compile script deals with these by just calc
+  ## we cant limit to those sites with no missing values because it would remove most sites
+
+## Output of this step: /sc/arion/projects/H_rg_psychgen/files/GSA-24v1-0_A1.pfb 
+#+END_SRC
+
+
+* BioMe CNV Pipeline | PennCNV Calling | Step 4 - make gc model
+
+#+NAME: make_gcmodel_file
+#+BEGIN_SRC shell
+## in shell
+
+## instructions for how to do this are in: cat /hpc/packages/minerva-centos7/penncnv/1.0.5/PennCNV-1.0.5/cal_gc_snp.pl 
+
+# set up 
+  ml purge 
+  ml penncnv/1.0.5
+  scr=/sc/arion/projects/psychgen2/scratch
+  pfb=/sc/arion/projects/H_rg_psychgen/files/GSA-24v1-0_A1.pfb 
+  gcm=/sc/arion/projects/H_rg_psychgen/files/GSA-24v1-0_A1.gcmodel
+
+# get gc data from ucsc 
+  cd ${scr}
+  wget http://hgdownload.cse.ucsc.edu/goldenPath/hg19/database/gc5Base.txt.gz
+  gunzip gc5Base.txt.gz
+  sort -k 2,2 -k 3,3n gc5Base.txt > gc5Base.txt.sorted
+
+# generate the GCmodel file
+  cal_gc_snp.pl ${scr}/gc5Base.txt.sorted ${pfb} > ${gcm}
+  ##NOTICE: Finished reading chr and position information for 636490 markers in 26 chromosomes
+  ##NOTICE: Finish processing 558991 lines in GC file
+  ## 
+  ## ... unclear why these numbers differ from number in the inputs ...
+  ##
+
+## Output: /sc/arion/projects/H_rg_psychgen/files/GSA-24v1-0_A1.gcmodel
+#+END_SRC
+
+
+* BioMe CNV Pipeline | PennCNV Calling | Step 5 - generate CNV calls
+
+#+NAME: call_with_pencnv
+#+BEGIN_SRC shell
+## in shell
+
+# setup
+  ml purge 
+  ml penncnv/1.0.5
+  snp=/sc/arion/projects/psychgen2/scratch/tmp_biome_gsa_intensity/gsa_intensity/GSA-24v1-0_A1_snpposfile.tsv
+  fls=/sc/arion/projects/H_rg_psychgen/files/gsa_signal_intensity_filelist_unzipped
+  scr=/sc/arion/projects/H_rg_psychgen/scratch/gsa_penncnv_calls
+  pfb=/sc/arion/projects/H_rg_psychgen/files/GSA-24v1-0_A1.pfb 
+  gcm=/sc/arion/projects/H_rg_psychgen/files/GSA-24v1-0_A1.gcmodel
+  hmm=/hpc/packages/minerva-centos7/penncnv/1.0.5/PennCNV-1.0.5/lib/hhall.hmm
+  cnv=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv
+
+# sanity check iids are unique (for output naming)
+  awk -F"/" '{print $NF}' ${fls} | wc -l #32595
+  awk -F"/" '{print $NF}' ${fls} | awk -F"." '{print $1}' | sort | uniq | wc -l #32595
+
+# generate commands
+  cd ${scr}
+  echo "" | tail -n+2 > ${scr}/commands
+  for i in `cat ${fls}`
+  do
+    iid=`basename ${i} | awk -F"." '{print $1}'`
+    echo "detect_cnv.pl --test --hmmfile ${hmm} --pfbfile ${pfb} --gcmodelfile ${gcm} --confidence --logfile ${cnv}/${iid}.penncnv.log --output ${cnv}/${iid}.penncnv.out ${i}" >> ${scr}/commands
+  done
+
+# split into chunks
+  split -a4 -d -l10 ${scr}/commands ${scr}/commands_
+
+# run
+  cd ${scr}
+  for i in `ls ${scr}/commands_????`
+  do mybsub psychgen `basename ${i}` 1000 0:30 premium 1 "sh ${i}"
+  done
+
+# check
+  cd ${scr}
+  ls command*stdout | sort | uniq > sent
+  grep -m1 -l Success command*stdout | sort | uniq > success
+  comm -23 sent success > fail
+  wc -l sent success fail
+  ##3260 sent
+  ##3260 success
+  ##   0 fail
+
+# list output files
+  find ${cnv}/ -wholename *penncnv.out > ${cnv}/penncnv.out.filelist
+
+# quick count of number of calls per sample
+  cat ${cnv}/penncnv.out.filelist | xargs wc -l | grep total -v > ${cnv}/penncnv.out.filelist.nrow
+  ##
+  ## based on looking at papers that use penncnv on comparable chips, it appears that the low counts we see (mean ~60/person) are consistent
+  ##
+
+# make a merged file (each contains identifier for individual)
+  echo "iid coordinates nmarkers length cn startsnp endsnp confidence" > ${cnv}/biome_gsa_merged.penncnv.txt
+  cat ${cnv}/penncnv.out.filelist | xargs cat | awk '{print $5, $1, $2, $3, $4, $6, $7, $8}' >> ${cnv}/biome_gsa_merged.penncnv.txt
+
+# clean up
+  cd ${scr}
+  rm commands* sent success fail
+
+## Output of this step: 
+## /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/penncnv.out.filelist{,.nrow}
+## /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/biome_gsa_merged.penncnv.txt
+
+#+END_SRC
+
+
+* BioMe CNV Pipeline | PennCNV Calling | Step 6 - clean up
+
+#+NAME: clean_up
+#+BEGIN_SRC shell
+## in shell
+
+rm -rf /sc/arion/projects/psychgen2/scratch/tmp_biome_gsa_intensity
+
+#+END_SRC
+
+
+* BioMe CNV Pipeline | Quality Control | Step 1 - format calls for plink and filter for number of markers, probe density, and size
+
+#+NAME: format_penncnv_for_plink_and_filters_for_nmarkers_probedensity_and_size
+#+BEGIN_SRC R
+## in R
+
+# setup
+  library(data.table)
+
+# data
+  cnv <- fread("/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/biome_gsa_merged.penncnv.txt")
+
+# format id column 
+  cnv[,iid:=basename(iid)]
+  cnv[,iid:=tstrsplit(iid, split=".", fixed=T, keep=1L)]
+
+# format position columns
+  cnv[,chr:=tstrsplit(coordinates, split=":", fixed=T, keep=1L)]
+  cnv[,range:=tstrsplit(coordinates, split=":", fixed=T, keep=2L)]
+  cnv[,start:=tstrsplit(range, split="-", fixed=T, keep=1L)]
+  cnv[,end:=tstrsplit(range, split="-", fixed=T, keep=2L)]
+
+# format type column
+  cnv[,type:=tstrsplit(cn, split=",", fixed=T, keep=2L)]
+  cnv[,type:=gsub("cn=", "", type)]
+
+# plink format
+  plk <- cnv[,.(FID=iid,IID=iid,CHR=gsub("chr","",chr),BP1=start,BP2=end,TYPE=type,SCORE=gsub("conf=","",confidence),SITES=gsub("numsnp=","",nmarkers))]
+  plk[,CHR:=as.integer(CHR)]
+  plk[,TYPE:=as.integer(TYPE)]
+  plk[,SCORE:=as.numeric(SCORE)]
+  plk[,BP1:=as.integer(BP1)]
+  plk[,BP2:=as.integer(BP2)]
+  plk[,SITES:=as.integer(SITES)]
+  plk[TYPE<2,INDEX:=paste0(FID, ".DEL.", .I)]
+  plk[TYPE>2,INDEX:=paste0(FID, ".DUP.", .I)]
+
+# sanity check autosomes only and no normal cn
+  nrow(plk[TYPE==2]) #[1] 0
+  nrow(plk[!(CHR>0 & CHR<23)]) #[1] 0
+
+# some metrics
+  nrow(plk[(BP2-BP1)<20000]) / nrow(plk) #[1] 0.3742754
+  nrow(plk[(BP2-BP1)<100000]) / nrow(plk) #[1] 0.774483
+  nrow(plk[SCORE<10]) / nrow(plk) #[1] 0.1194254
+
+# qc for nprobes and probe density
+  plk[,FILTER.lt10snp:=FALSE]
+  plk[SITES<10,FILTER.lt10snp:=TRUE]
+
+# qc for probe density
+  plk[,DENSITY:=SITES/(BP2-BP1)]
+  plk[,FILTER.lt5en5dens:=FALSE]
+  plk[DENSITY<(1/20000), FILTER.lt5en5dens:=TRUE]
+
+# qc for size < 10kb
+  plk[,FILTER.lt10kb:=FALSE]
+  plk[(BP2-BP1)<10000,FILTER.lt10kb:=TRUE]
+
+# qc for a deletion and insertion called for same person in same region
+  del <- plk[TYPE<2]
+  dup <- plk[TYPE>2]
+  tar <- del[,.(CHR, BP1, BP2, IID)]
+  setkey(tar, CHR, BP1, BP2)
+  tmp <- dup[,.(CHR, BP1, BP2, IID)]
+  olp <- foverlaps(tmp, tar, nomatch=0)
+  nrow(olp[IID==i.IID]) #[1] 0 ... there are no instances of this
+
+# clean up
+  qc1 <- plk[!FILTER.lt5en5dens & !FILTER.lt10snp & !FILTER.lt10kb][,.(FID, IID, CHR, BP1, BP2, TYPE, SCORE, SITES)]
+
+# write
+  fwrite(qc1, quo=F, col=T, row=F, sep="\t", file="/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.cnv")
+  fwrite(plk, quo=F, col=T, row=F, sep="\t", file="/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.cnv")
+
+#+END_SRC
+#+BEGIN_SRC shell
+## in shell
+
+# setup
+  ml plink/1.07
+  raw=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged
+  bas=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb
+
+# fam file (should be made from raw file before removing any cnv)
+  awk -F"\t" -v OFS="\t" 'NR > 1 {print $1, $1, 0, 0, 1, 1}' ${raw}.cnv | sort | uniq > ${bas}.fam
+
+# map file
+  plink --cnv-list ${bas}.cnv --cnv-make-map --out ${bas} --noweb --silent
+
+# summary 
+  plink --cfile ${bas} --out ${bas} --silent
+  plink --cfile ${bas} --out ${bas}.del --cnv-del --silent
+  plink --cfile ${bas} --out ${bas}.dup --cnv-dup --silent
+
+## Output of this step:
+## /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.cnv
+## /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.{cnv,fam,cnv.map,cnv.indiv,cnv.summary}
+#+END_SRC
+
+
+* BioMe CNV Pipeline | Quality Control | Step 2 - join CNVs split by the HMM
+
+#+NAME: join_cnv_split_by_hmm
+#+BEGIN_SRC sh
+## in shell
+
+# setup 
+  ml plink/1.07
+  script=/sc/arion/work/charna02/scripts/icc/join_cnvs.pl
+  bas=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb
+  out=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm
+  scr=/sc/arion/projects/H_rg_psychgen/scratch
+
+# list inds
+  awk '{print $1}' ${bas}.fam > ${scr}/tmp
+  split -a4 -d -l10 ${scr}/tmp ${scr}/tmp_ilist_
+
+# sort
+  sort -nk 3 -nk 4 -nk5 ${bas}.cnv > ${scr}/tmp.cnv.sorted
+  for i in `ls ${scr}/tmp_ilist_????`
+  do ln -f -s ${scr}/tmp.cnv.sorted ${scr}/tmp.cnv.sorted.`echo ${i}|awk -F"_" '{print $NF}'`
+  done
+
+# run
+  cd ${scr}
+  for i in `ls ${scr}/tmp_ilist_????`
+  do 
+    idx=`echo ${i}|awk -F"_" '{print $NF}'`
+    mybsub psychgen `basename ${i}` 1000 0:10 premium 1 "perl ${script} ${scr}/tmp.cnv.sorted.${idx} ${i}"
+  done
+
+# check 
+  ls ${scr}/tmp_ilist_????.stdout | sort | uniq > sent
+  grep -m1 -l Success ${scr}/tmp_ilist_????.stdout | sort | uniq > success
+  comm -23 sent success > fail
+  wc -l sent success fail
+  ##3259 sent
+  ##3259 success
+  ##   0 fail
+
+# combine
+  cat ${scr}/tmp.cnv.sorted.????.joined > ${scr}/tmp.cnv.sorted.joined
+
+# format and make map
+  (head -1 ${bas}.cnv;tail -n+2 ${scr}/tmp.cnv.sorted.joined) > ${out}.cnv
+  cp ${bas}.fam ${out}.fam
+  plink --cnv-list ${out}.cnv --cnv-make-map --out ${out} --silent
+
+# summary 
+  plink --cfile ${out} --out ${out} --silent
+  plink --cfile ${out} --out ${out}.del --cnv-del --silent
+  plink --cfile ${out} --out ${out}.dup --cnv-dup --silent
+
+# clean up 
+  rm ${scr}/tmp_ilist_????
+  rm ${scr}/tmp_ilist_????.std???
+  rm ${scr}/tmp.cnv.sorted.joined
+  rm ${scr}/tmp.cnv.sorted.????
+  rm ${scr}/tmp.cnv.sorted.????.joined
+  rm ${scr}/{split.info,sent,success,fail}
+
+## Output of this step: /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.{cnv,fam,cnv.map,cnv.indiv,cnv.summary}
+#+END_SRC
+
+
+* BioMe CNV Pipeline | Quality Control | Step 3 - NSEG outliers filter
+
+#+NAME: nseg_outliers
+#+BEGIN_SRC R
+## First, find NSEG outliers (in R)
+
+# setup
+  library(data.table)
+  library(ggplot2)
+  library(ggthemes)
+  setwd("/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink")
+
+# data
+  cnv <- fread("biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.cnv.indiv")[,.(FID, IID, NSEG.CNV=NSEG, KB.CNV=KB, KBAVG.CNV=KBAVG)]
+  del <- fread("biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.del.cnv.indiv")[,.(FID, IID, NSEG.DEL=NSEG, KB.DEL=KB, KBAVG.DEL=KBAVG)]
+  dup <- fread("biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.dup.cnv.indiv")[,.(FID, IID, NSEG.DUP=NSEG, KB.DUP=KB, KBAVG.DUP=KBAVG)]
+  cnv <- merge(merge(cnv, del), dup)
+  raw <- fread("/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/biome_gsa_merged.penncnv.txt")[,.(file=iid)]
+  anc <- fread("/sc/arion/projects/psychgen2/psychosis_nlp/files/AWC_BioMe_GENETICANCESTRY.tsv", na=c("NA",""))[!is.na(gill.ContinentalGrouping),.(FID=IID, ancestry=gill.ContinentalGrouping)]
+
+# batches
+  raw[,file:=basename(file)]
+  raw[,iid:=tstrsplit(file, split=".", fixed=T, keep=1L)]
+  raw[,info:=tstrsplit(file, split=".", fixed=T, keep=2L)]
+  raw[,c("chip", "position"):=tstrsplit(info, split="_")]
+  raw <- unique(raw[,.(FID=iid, chip=paste0("chip.", chip))])
+  cnv <- merge(cnv, raw, by="FID")
+  cnv <- merge(cnv, anc, all.x=T)
+  chp <- cnv[,list( mean.NSEG.CNV=mean(NSEG.CNV), 
+                   mean.KB.CNV=mean(KB.CNV), 
+                   mean.KBAVG.CNV=mean(KBAVG.CNV), 
+                   mean.NSEG.DEL=mean(NSEG.DEL), 
+                   mean.KB.DEL=mean(KB.DEL), 
+                   mean.KBAVG.DEL=mean(KBAVG.DEL), 
+                   mean.NSEG.DUP=mean(NSEG.DUP), 
+                   mean.KB.DUP=mean(KB.DUP), 
+                   mean.KBAVG.DUP=mean(KBAVG.DUP),
+                   median.NSEG.CNV=median(NSEG.CNV), 
+                   median.KB.CNV=median(KB.CNV), 
+                   median.KBAVG.CNV=median(KBAVG.CNV), 
+                   median.NSEG.DEL=median(NSEG.DEL), 
+                   median.KB.DEL=median(KB.DEL), 
+                   median.KBAVG.DEL=median(KBAVG.DEL), 
+                   median.NSEG.DUP=median(NSEG.DUP), 
+                   median.KB.DUP=median(KB.DUP), 
+                   median.KBAVG.DUP=median(KBAVG.DUP)),by=list(chip)]
+  mycols <- c("NSEG.CNV", "KB.CNV", "KBAVG.CNV", "NSEG.DEL", "KB.DEL", "KBAVG.DEL", "NSEG.DUP", "KB.DUP", "KBAVG.DUP")
+  for (i in mycols){
+      imean <- paste0("mean.", i)
+      imedn <- paste0("median.", i)
+      p1 <- ggplot( chp, aes( get(imean) ) ) + geom_histogram(fill="white", col="black", bins=50) + theme_base() + xlab(imean)
+      p2 <- ggplot( chp, aes( get(imedn) ) ) + geom_histogram(fill="white", col="black", bins=50) + theme_base() + xlab(imedn)
+      show(p1)
+      show(p2)
+  }
+
+# define outliers
+  outliers <- c(cnv[NSEG.CNV %in% boxplot(NSEG.CNV)$out]$FID)
+  p1 <- ggplot(cnv, aes(NSEG.CNV)) + geom_histogram(fill="white", col="black", bins=50)
+  p2 <- ggplot(cnv[!FID %in% outliers], aes(NSEG.CNV)) + geom_histogram(fill="white", col="black", bins=50)
+  pdf("~/www/figures/biome_cnv_qc_nsegoutliers.pdf")
+    show(p1)
+    show(p2)
+    for (i in mycols){
+        imean <- paste0("mean.", i)
+        imedn <- paste0("median.", i)
+        p3 <- ggplot( chp, aes( get(imean) ) ) + geom_histogram(fill="red", col="black", bins=50) + theme_base() + xlab(imean)
+        p4 <- ggplot( chp, aes( get(imedn) ) ) + geom_histogram(fill="red", col="black", bins=50) + theme_base() + xlab(imedn)
+        show(p3)
+        show(p4)
+    }
+  dev.off()
+
+# plots by ancestry
+  pdt <- cnv[!FID %in% outliers & ancestry %in% c("EUR", "AMR", "AFR")]
+  pdf("~/www/figures/biome_cnv_qc_nsegbyancestry.pdf")
+  for (i in mycols){
+      p <- ggplot(pdt, aes( get(i))) + geom_histogram(fill="red", col="black", bins=50) + theme_base() + ggtitle(i) + facet_wrap(~ancestry)
+      show(p)
+  }
+  dev.off()
+
+# write
+  outf <- "biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.outliers"
+  fwrite(as.data.table(outliers)[,.(outliers,outliers)], quote=F, col.names=F, row.names=F, sep="\t", file = outf) 
+
+## Output of this step: 
+## /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.merghmm.outliers
+## ~/www/figures/biome_cnv_qc_nsegoutliers.pdf
+#+END_SRC
+#+BEGIN_SRC sh
+## Second, remove NSEG outliers (in shell)
+
+# setup 
+  ml plink/1.07
+  bas=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm
+  out=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers
+  olr=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.outliers
+  scr=/sc/arion/projects/H_rg_psychgen/scratch
+
+# remove 
+  plink --noweb --cfile ${bas} --remove ${olr} --cnv-write --out ${out} --silent
+  plink --noweb --cnv-list ${out}.cnv --cnv-make-map --out  ${out} --silent
+
+## Output of this step: /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers
+
+#+END_SRC
+
+
+* BioMe CNV Pipeline | Quality Control | Step 4 - frequency and size filters
+
+#+NAME: freq_and_size_filters
+#+BEGIN_SRC sh
+## in shell
+
+# setup 
+  ml plink/1.07  
+  bas=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers
+  scr=/sc/arion/projects/H_rg_psychgen/scratch
+
+# size
+  I=${bas}
+  O=${bas}.lt20kb
+  plink --noweb --cfile ${I} --cnv-kb 20 --cnv-write --out ${O} --silent
+  plink --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+  I=${bas}
+  O=${bas}.lt100kb
+  plink --noweb --cfile ${I} --cnv-kb 100 --cnv-write --out ${O} --silent
+  plink --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+
+# freq
+  I=${bas}.lt20kb
+  O=${bas}.lt20kb.lt1pct
+  plink --cfile ${I} --cnv-freq-exclude-above $((`cat ${I}.fam|wc -l`/100)) --cnv-overlap 0.5 --cnv-write --out ${O} --silent
+  plink --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+  I=${bas}.lt100kb
+  O=${bas}.lt100kb.lt1pct
+  plink --cfile ${I} --cnv-freq-exclude-above $((`cat ${I}.fam|wc -l`/100)) --cnv-overlap 0.5 --cnv-write --out ${O} --silent
+  plink --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+
+## Output of this step: /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt{20,100}kb{,.lt1pct}
+#+END_SRC
+
+
+* BioMe CNV Pipeline | Quality Control | Step 5 - the "known CNV" filter
+
+#+NAME: known_cnvs
+#+BEGIN_SRC sh
+## in shell
+
+# This step removes segments that: 
+# a) are in regions with known rearrangements
+# b) are present in dgv 
+# c) are common in hapmap population
+# d) are in regions with sequencing gaps
+
+# setup 
+  ml plink/1.07  
+  scr=/sc/arion/projects/H_rg_psychgen/scratch
+
+# make helper file
+  cat /sc/arion/projects/psychgen/bipolar/iccbd/merged/files/cnv/rm.{rearrangements,dgv.1pc,common_hapmap_cnvs,seqgaps}.hg19 > ${scr}/tmp 
+
+# filter
+  I=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt20kb.lt1pct
+  O=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt20kb.lt1pct.rmknown
+  plink --noweb --cfile ${I} --cnv-overlap 0.5 --cnv-exclude ${scr}/tmp --cnv-write --silent --out ${O}
+  plink --noweb --cnv-list ${O}.cnv --cnv-make-map --silent --out ${O}
+  I=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt100kb.lt1pct
+  O=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt100kb.lt1pct.rmknown
+  plink --noweb --cfile ${I} --cnv-overlap 0.5 --cnv-exclude ${scr}/tmp --cnv-write --silent --out ${O}
+  plink --noweb --cnv-list ${O}.cnv --cnv-make-map --silent --out ${O}
+
+## Output of this step: /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt{20,100}kb.lt1pct.rmknown
+#+END_SRC
+
+
+* BioMe CNV Pipeline | Quality Control | Deprecated Step - pLI/CNV rate sanity check for 20KB threshold 
+
+#+NAME: pli_cnv_rate_check_for_20kb_thresh
+#+BEGIN_SRC R
+## in R
+
+# setup 
+  library(data.table)
+  library(ggplot2)
+  library(ggthemes)
+  options(scipen=100, digits=4) 
+
+# data 
+  c20 <- fread("/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt20kb.lt1pct.rmknown.cnv")
+  c1h <- fread("/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt100kb.lt1pct.rmknown.cnv")
+  gls <- fread("/sc/arion/projects/psychgen/resources/useful_files/glist-hg19")[,.(CHR=paste0("chr",V1), BP1=V2, BP2=V3, SYMBOL=V4)]
+  pli <- unique(fread("/sc/arion/projects/psychgen2/resources/gnomAD/2.1.1/Constraint/gnomad.v2.1.1.lof_metrics.by_gene.txt")[,.(SYMBOL=gene, pLI)])[!is.na(pLI)]
+  c20 <- c20[,.(IID, CHR=paste0("chr",CHR), BP1, BP2, SIZE=BP2-BP1)]
+  c1h <- c1h[,.(IID, CHR=paste0("chr",CHR), BP1, BP2, SIZE=BP2-BP1)]
+  gls <- merge(gls, pli, by="SYMBOL")
+
+# overlap gene list with cnv
+  setkey(gls, CHR, BP1, BP2)
+  c20 <- foverlaps(c20, gls, nomatch=0)[,.(IID, CHR, BP1=i.BP1, BP2=i.BP2, SIZE, SYMBOL, pLI, QCSET="20KB")]
+  c1h <- foverlaps(c1h, gls, nomatch=0)[,.(IID, CHR, BP1=i.BP1, BP2=i.BP2, SIZE, SYMBOL, pLI, QCSET="100KB")]
+  cnv <- rbind(c20, c1h)
+
+# bins by size
+  stp <- 25
+  low <- 20 
+  hih <- low + stp
+  don <- 300
+  cnv[SIZE>=don, SIZEBIN:=paste0(">=",don,"KB")]
+  lev <- c()
+  while (hih <= don){
+      cat(low, hih, '\n') 
+      nam <- paste0(low, "-", hih, "KB")
+      lev <- c(lev, nam)
+      cnv[SIZE>=low*1000 & SIZE<hih*1000, SIZEBIN := nam]
+      low <- hih
+      hih <- low + stp
+  }
+  lev <- c(lev, paste0(">=",don,"KB"))
+  cnv[,SIZEBIN:=factor(SIZEBIN, levels=lev)]
+  gnt <- cnv[,list(NCNV=.N), by=list(SYMBOL, pLI, QCSET, SIZEBIN)]
+
+# bins by pli
+  gnt[pLI<=0.25, pLIBIN := "pLI <= 0.25"]
+  gnt[pLI>0.25 & pLI<=0.75, pLIBIN := "0.25 < pLI <= 0.75"]
+  gnt[pLI>0.75, pLIBIN := "pLI > 0.75"]
+  gnt[,pLIBIN:=factor(pLIBIN, levels=c("pLI <= 0.25","0.25 < pLI <= 0.75","pLI > 0.75"))]
+  cnv[pLI<=0.25, pLIBIN := "pLI <= 0.25"]
+  cnv[pLI>0.25 & pLI<=0.75, pLIBIN := "0.25 < pLI <= 0.75"]
+  cnv[pLI>0.75, pLIBIN := "pLI > 0.75"]
+  cnv[,pLIBIN:=factor(pLIBIN, levels=c("pLI <= 0.25","0.25 < pLI <= 0.75","pLI > 0.75"))]
+
+# binary size
+  cnv[SIZE<80000,BINARY:="<80KB"]
+  cnv[SIZE>100000,BINARY:=">100KB"]
+  gn2 <- cnv[QCSET=="20KB",list(NCNV=.N), by=list(SYMBOL, pLI, QCSET, BINARY)]
+ 
+# plot
+  pdf("~/www/figures/biome_cnv_pli_stuff.pdf", width=15, height=12)
+    ggplot(gnt[QCSET=="20KB"],aes(pLIBIN, NCNV, fill=pLIBIN)) + geom_violin() + theme_base() + facet_wrap(~SIZEBIN, scales="free") +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+  dev.off()
+
+#+END_SRC
+
+
+* BioMe CNV Pipeline | Quality Control | Step 6A - generate 100KB callsets for analysis
+
+#+NAME: final_sets_for_analysis
+#+BEGIN_SRC shell
+## in shell
+
+## "sing" - singletons
+## "non-sing" - not singletons
+## "cnv" - deletions and duplications
+## "del" - deletions
+## "dup" - duplications
+## "genic" - calls overlapping genes
+
+# setup 
+  ml plink/1.07  
+  scr=/sc/arion/projects/H_rg_psychgen/scratch
+  bas=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt100kb.lt1pct.rmknown
+  gen=/sc/arion/projects/psychgen/resources/useful_files/glist-hg19  
+  I=${bas}
+ 
+# sing | cnv
+  O=${bas}.sing
+  plink --noweb --cfile ${I} --cnv-write --out ${O} --cnv-overlap 0.5 --cnv-freq-exclude-above 1 --silent
+  plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+
+# genic | non-sing | cnv
+  O=${bas}.genic
+  plink --noweb --cfile ${I} --cnv-intersect ${gen} --cnv-write --out ${O} --silent
+  plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+
+# genic | sing | cnv
+  O=${bas}.genic.sing
+  plink --noweb --cfile ${I} --cnv-intersect ${gen} --cnv-write --out ${O} --cnv-overlap 0.5 --cnv-freq-exclude-above 1 --silent
+  plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+
+# del dup 
+  for i in del dup 
+  do 
+
+	# non-sing
+      O=${bas}.${i}
+      plink --noweb --cfile ${I} --cnv-write --out ${O} --cnv-${i} --silent
+      plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+	
+	# sing
+      O=${bas}.${i}.sing
+      plink --noweb --cfile ${I} --cnv-write --out ${O} --cnv-${i} --cnv-overlap 0.5 --cnv-freq-exclude-above 1 --silent
+      plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+		     
+    # genic | non-sing
+      O=${bas}.${i}.genic
+      plink --noweb --cfile ${I} --cnv-intersect ${gen} --cnv-write --out ${O} --cnv-${i} --silent
+      plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+
+    # genic | sing
+      O=${bas}.${i}.genic.sing
+      plink --noweb --cfile ${I} --cnv-intersect ${gen} --cnv-write --out ${O} --cnv-${i} --cnv-overlap 0.5 --cnv-freq-exclude-above 1 --silent
+      plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+		    
+  done
+
+#+END_SRC
+
+
+* BioMe CNV Pipeline | Quality Control | Step 6B - generate 20KB callsets for analysis
+
+#+BEGIN_SRC shell
+## in shell 
+
+# setup 
+  ml plink/1.07  
+  scr=/sc/arion/projects/H_rg_psychgen/scratch
+  bas=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt20kb.lt1pct.rmknown
+  gen=/sc/arion/projects/psychgen/resources/useful_files/glist-hg19  
+  I=${bas}
+ 
+# sing | cnv
+  O=${bas}.sing
+  plink --noweb --cfile ${I} --cnv-write --out ${O} --cnv-overlap 0.5 --cnv-freq-exclude-above 1 --silent
+  plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+
+# genic | non-sing | cnv
+  O=${bas}.genic
+  plink --noweb --cfile ${I} --cnv-intersect ${gen} --cnv-write --out ${O} --silent
+  plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+
+# genic | sing | cnv
+  O=${bas}.sing.genic
+  plink --noweb --cfile ${I} --cnv-intersect ${gen} --cnv-write --out ${O} --cnv-overlap 0.5 --cnv-freq-exclude-above 1 --silent
+  plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+
+# del dup 
+  for i in del dup 
+  do 
+
+      # non-sing
+      O=${bas}.${i}
+      plink --noweb --cfile ${I} --cnv-write --out ${O} --cnv-${i} --silent
+      plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+      
+      # sing
+      O=${bas}.${i}.sing
+      plink --noweb --cfile ${I} --cnv-write --out ${O} --cnv-${i} --cnv-overlap 0.5 --cnv-freq-exclude-above 1 --silent
+      plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+           
+      # genic | non-sing
+      O=${bas}.${i}.genic
+      plink --noweb --cfile ${I} --cnv-intersect ${gen} --cnv-write --out ${O} --cnv-${i} --silent
+      plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+
+      # genic | sing
+      O=${bas}.${i}.genic.sing
+      plink --noweb --cfile ${I} --cnv-intersect ${gen} --cnv-write --out ${O} --cnv-${i} --cnv-overlap 0.5 --cnv-freq-exclude-above 1 --silent
+      plink --noweb --cnv-list ${O}.cnv --cnv-make-map --out ${O} --silent
+          
+  done
+
+## Output of this step: 
+## /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt{20,100}kb.lt1pct.{sing,genic,genic.sing}
+## /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt{20,100}kb.lt1pct.del.{sing,genic,genic.sing}
+## /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt{20,100}kb.lt1pct.dup.{sing,genic,genic.sing}
+#+END_SRC
+
+
+* BioMe CNV Pipeline | Quality Control | Step 7 - create a summary of the QC process
+
+#+NAME: summarize
+#+BEGIN_SRC shell
+## in shell
+
+# setup 
+  ml plink/1.07  
+  scr=/sc/arion/projects/H_rg_psychgen/scratch
+  dir=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink
+  bas=${dir}/biome_gsa_merged
+  echo "qcstepN qcstep ncnv nind" > ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+
+# raw 
+  indx=0
+  step="raw"
+  let ncnv=`cat ${bas}.cnv | awk 'NR>1' | wc -l`
+  let nind=`cat ${bas}.cnv | awk 'NR>1 {print $1}' | sort | uniq | wc -l`
+  echo "${indx} ${step} ${ncnv} ${nind}" >> ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+
+# initial qc steps
+  cur=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb
+  indx=1
+  step="remove_cnvs_of_size_less_than_10kb|remove_cnvs_with_less_than_10_markers|remove_cnvs_with_less_than_1_marker_per_20kb"
+  let ncnv=`cat ${cur}.cnv | awk 'NR>1' | wc -l`
+  echo "${indx} ${step} ${ncnv} ${nind}" >> ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+
+# cnv with < 10 markers
+  indx=1a
+  step="remove_cnvs_with_less_than_10_markers"
+  let ncnv=`cat ${bas}.cnv | awk '$10=="FALSE"' | wc -l`
+  echo "${indx} ${step} ${ncnv} ${nind}" >> ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+
+# cnv with probe density < 5e-5
+  indx=1b
+  step="remove_cnvs_with_less_than_1_marker_per_20kb"
+  let ncnv=`cat ${bas}.cnv | awk '$12=="FALSE"' | wc -l`
+  echo "${indx} ${step} ${ncnv} ${nind}" >> ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+
+# cnv less than 10kb
+  indx=1c
+  step="remove_cnvs_of_size_less_than_10kb"
+  let ncnv=`cat ${bas}.cnv | awk '$13=="FALSE"' | wc -l`
+  echo "${indx} ${step} ${ncnv} ${nind}" >> ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+
+# merging cnv split by hmm
+  cur=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm
+  indx=2
+  step="merging_cnvs_split_by_hmm"
+  let ncnv=`cat ${cur}.cnv | awk 'NR>1' | wc -l`
+  let nind=`cat ${cur}.fam | wc -l`
+  echo "${indx} ${step} ${ncnv} ${nind}" >> ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+
+# nseg outliers
+  cur=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers
+  indx=3
+  step="removing_inds_that_are_nseg_outliers"
+  let ncnv=`cat ${cur}.cnv | awk 'NR>1' | wc -l`
+  let nind=`cat ${cur}.fam | wc -l`
+  echo "${indx} ${step} ${ncnv} ${nind}" >> ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+
+# size 100kb
+  cur=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt100kb
+  indx=4
+  step="keeping_cnv_over_100kb"
+  let ncnv=`cat ${cur}.cnv | awk 'NR>1' | wc -l`
+  let nind=`cat ${cur}.fam | wc -l`
+  echo "${indx} ${step} ${ncnv} ${nind}" >> ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+
+# size 20kb
+  cur=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt20kb
+  indx=4
+  step="keeping_cnv_over_20kb"
+  let ncnv=`cat ${cur}.cnv | awk 'NR>1' | wc -l`
+  let nind=`cat ${cur}.fam | wc -l`
+  echo "${indx} ${step} ${ncnv} ${nind}" >> ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+
+# freq < 1%
+  cur=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt20kb.lt1pct
+  indx=5
+  step="keeping_cnv_with_freq_less_than_1pct(20kb)"
+  let ncnv=`cat ${cur}.cnv | awk 'NR>1' | wc -l`
+  let nind=`cat ${cur}.fam | wc -l`
+  echo "${indx} ${step} ${ncnv} ${nind}" >> ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+  cur=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt100kb.lt1pct
+  indx=5
+  step="keeping_cnv_with_freq_less_than_1pct"
+  let ncnv=`cat ${cur}.cnv | awk 'NR>1' | wc -l`
+  let nind=`cat ${cur}.fam | wc -l`
+  echo "${indx} ${step} ${ncnv} ${nind}" >> ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+
+# known cnvs
+  cur=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt20kb.lt1pct.rmknown
+  indx=6
+  step="remove_cnvs_in_ref_datasets(20kb)"
+  let ncnv=`cat ${cur}.cnv | awk 'NR>1' | wc -l`
+  let nind=`cat ${cur}.fam | wc -l`
+  echo "${indx} ${step} ${ncnv} ${nind}" >> ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+  cur=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt100kb.lt1pct.rmknown
+  indx=6
+  step="remove_cnvs_in_ref_datasets"
+  let ncnv=`cat ${cur}.cnv | awk 'NR>1' | wc -l`
+  let nind=`cat ${cur}.fam | wc -l`
+  echo "${indx} ${step} ${ncnv} ${nind}" >> ${dir}/biome_gsa_merged_cnv_qc_summary.txt
+
+## Output of this step: /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/biome_gsa_merged_cnv_qc_summary.txt
+#+END_SRC
+
+
+* BioMe CNV Pipeline | Quality Control | Step 8 - generate individual-level CNV counts
+
+#+NAME: counts
+#+BEGIN_SRC shell
+## in shell
+
+# setup 
+  ml plink/1.07  
+  scr=/sc/arion/projects/H_rg_psychgen/scratch
+  dir=/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink
+  bas=${dir}/biome_gsa_merged
+  gen=/sc/arion/projects/psychgen/resources/useful_files/glist-hg19
+  cd ${dir}/counts
+
+# list 
+  ls ${dir}/biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.lt{20,100}kb.lt1pct.*cnv | sed s/'.cnv'$/''/g | grep rmknown > ${scr}/clist
+
+# generate counts only (no results; this is quick)
+  for i in `cat ${scr}/clist` 
+  do plink --noweb --silent --cfile ${i} --out ${dir}/counts/`basename ${i}` --cnv-count ${gen} #--cnv-kb ${j} 
+  done
+  rm ${dir}/counts/*summary
+  rm ${dir}/counts/*log
+
+#+END_SRC
+#+BEGIN_SRC R
+
+# setup 
+  library(data.table)
+
+# counts
+  count_dir  <- "/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/counts"
+  count_path <- list.files(path = count_dir, pattern="*cnv.indiv",full.names=TRUE)
+  count_name <- gsub(".cnv.indiv","",gsub("icc.15.","",list.files(path = count_dir, pattern="*cnv.indiv")))
+  count_name <- gsub("biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.rmoutliers.", "", count_name)
+  count_name <- gsub("lt", "", count_name)
+  count_name <- gsub(".rmknown", "", count_name)
+  count_name <- gsub(".1pct", "", count_name)
+  count_name <- gsub(".", "_", fixed=T, count_name)
+  for (i in 1:length(count_path)){
+    print(i)
+    new_count <- fread(count_path[i])[,.(FID,NSEG,KB,KBAVG,GCOUNT=COUNT)]
+    colnames(new_count)[c(2,3,4,5)] <- paste(colnames(new_count)[c(2,3,4,5)],count_name[i],sep=".")
+    if (i==1){
+        all_count <- new_count
+    } else {
+        all_count <- merge(all_count,new_count,by="FID",all=T)
+    }
+  }
+  colnames(all_count)[1] <- "IID"
+  colnames(all_count)[2:ncol(all_count)] <- paste0("cnvburden.", colnames(all_count)[2:ncol(all_count)])
+
+# add chip and ancestry
+  raw <- fread("/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/biome_gsa_merged.penncnv.txt")[,.(file=iid)]
+  raw[,file:=basename(file)]
+  raw[,iid:=tstrsplit(file, split=".", fixed=T, keep=1L)]
+  raw[,info:=tstrsplit(file, split=".", fixed=T, keep=2L)]
+  raw[,c("chip", "position"):=tstrsplit(info, split="_")]
+  raw <- unique(raw[,.(IID=iid, chip=paste0("chip.", chip))])
+
+# write
+  all_count <- merge(all_count, raw) 
+  fout <- "/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/counts/biome_gsa_merged_counts.tsv"
+  fwrite(all_count, row=F, quo=F, sep='\t', na="NA", file=fout)
+
+# plots by ancestry
+  raw <- merge(raw, anc, all=T)
+  cnt <- merge(all_count, raw, by="IID")
+  anc <- fread("/sc/arion/projects/psychgen2/psychosis_nlp/files/AWC_BioMe_GENETICANCESTRY.tsv", na=c("NA",""))[!is.na(gill.ContinentalGrouping),.(IID, ancestry=gill.ContinentalGrouping)]
+  pdt <- cnt[ancestry %in% c("EUR", "AMR", "AFR")]
+  cnvcols <- grep("cnvburden", colnames(cnt), value=T)
+  pdf("~/www/figures/biome_cnv_qc_nsegbyancestry.pdf")
+  for (i in cnvcols){
+      p <- ggplot(pdt, aes( get(i))) + geom_histogram(fill="red", col="black", bins=50) + theme_base() + ggtitle(i) + facet_wrap(~ancestry)
+      show(p)
+  }
+  dev.off()
+
+## Output of this step: /sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/counts/biome_gsa_merged_counts.tsv
+#+END_SRC
+
+
+* BioMe CNV Pipeline | Quality Control | Miscellaneous - investigate duplication issue identified
+
+#+NAME: dup_issue_pre_and_pos_qc
+#+BEGIN_SRC R
+## in R 
+
+# setup
+  library(data.table)
+  library(ggplot2)
+  library(ggthemes)
+  setwd("/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink")
+
+# pre-qc
+  cnv <- fread("biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.cnv.indiv")[,.(FID, IID, NSEG.CNV=NSEG, KB.CNV=KB, KBAVG.CNV=KBAVG)]
+  del <- fread("biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.del.cnv.indiv")[,.(FID, IID, NSEG.DEL=NSEG, KB.DEL=KB, KBAVG.DEL=KBAVG)]
+  dup <- fread("biome_gsa_merged.lt10snp.lt5en5dens.lt10kb.merghmm.dup.cnv.indiv")[,.(FID, IID, NSEG.DUP=NSEG, KB.DUP=KB, KBAVG.DUP=KBAVG)]
+  cnv <- merge(merge(cnv, del), dup)
+  raw <- fread("/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/biome_gsa_merged.penncnv.txt")[,.(file=iid)]
+  anc <- fread("/sc/arion/projects/psychgen2/psychosis_nlp/files/AWC_BioMe_GENETICANCESTRY.tsv", na=c("NA",""))[!is.na(gill.ContinentalGrouping),.(FID=IID, ancestry=gill.ContinentalGrouping)]
+  raw[,file:=basename(file)]
+  raw[,iid:=tstrsplit(file, split=".", fixed=T, keep=1L)]
+  raw[,info:=tstrsplit(file, split=".", fixed=T, keep=2L)]
+  raw[,c("chip", "position"):=tstrsplit(info, split="_")]
+  raw <- unique(raw[,.(FID=iid, chip=paste0("chip.", chip))])
+  cnv <- merge(cnv, raw, by="FID")
+  pre.cnv <- merge(cnv, anc, all.x=T)
+  kep <- c("IID", "NSEG.CNV", "NSEG.DEL","NSEG.DUP", "chip", "ancestry")
+  pre.cnv <-   pre.cnv[,kep,with=F]
+
+# post-qc
+  kep20 <- c("IID", "cnvburden.NSEG.20kb", "cnvburden.NSEG.20kb_del", "cnvburden.NSEG.20kb_dup", "chip")
+  kep100 <- c("IID", "cnvburden.NSEG.100kb", "cnvburden.NSEG.100kb_del", "cnvburden.NSEG.100kb_dup", "chip")
+  anc <- fread("/sc/arion/projects/psychgen2/psychosis_nlp/files/AWC_BioMe_GENETICANCESTRY.tsv", na=c("NA",""))[!is.na(gill.ContinentalGrouping),.(IID, ancestry=gill.ContinentalGrouping)]
+  pos20.cnv <- fread("/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/counts/biome_gsa_merged_counts.tsv")[,kep20,with=F]
+  pos100.cnv <- fread("/sc/arion/projects/H_rg_psychgen/data/cnv/gsa_penncnv/plink/counts/biome_gsa_merged_counts.tsv")[,kep100,with=F]
+  pos20.cnv <- merge(pos20.cnv, anc, all.x=T)
+  pos100.cnv <- merge(pos100.cnv, anc, all.x=T)
+
+# make 1 table
+  colnames(pre.cnv) <- colnames(pos20.cnv) <- colnames(pos100.cnv) <- c("IID", "CNV", "DEL", "DUP", "CHIP", "ANC")
+  outliers <- c(pre.cnv[CNV %in% boxplot(CNV)$out]$IID)
+  pre.cnv[,VERSION:="PREQC"]
+  pos20.cnv[,VERSION:="POSTQC20KB"]
+  pos100.cnv[,VERSION:="POSTQC100KB"]
+  cnv <- rbind( pre.cnv, pos20.cnv, pos100.cnv)
+  cnv[,VERSION:=factor(VERSION, levels=c("POSTQC100KB","POSTQC20KB","PREQC"))]
+  chp <- cnv[,list( mean.CNV=mean(CNV), 
+                   mean.DEL=mean(DEL), 
+                   mean.DUP=mean(DUP), 
+                   median.CNV=median(CNV), 
+                   median.DEL=median(DEL), 
+                   median.DUP=median(DUP)),by=list(CHIP, VERSION)]
+
+# plot
+  pdt <- cnv[!IID %in% outliers & ANC %in% c("EUR", "AMR", "AFR")]
+  pdf("~/www/figures/biome_cnv_qc_nseg_prepostqc.pdf", width=15, height=11)
+  for (i in c("CNV", "DEL", "DUP")){
+      imean <- paste0("mean.", i)
+      imedn <- paste0("median.", i)
+      p1 <- ggplot( chp, aes( get(imean) ) ) + geom_histogram(fill="red", col="black", bins=50) + theme_base() + xlab(imean) + facet_wrap(~VERSION, scales="free")
+      p2 <- ggplot( chp, aes( get(imedn) ) ) + geom_histogram(fill="red", col="black", bins=50) + theme_base() + xlab(imedn) + facet_wrap(~VERSION, scales="free")
+      p3 <- ggplot( pdt, aes( get(i))) + geom_histogram(fill="red", col="black", bins=50) + theme_base() + xlab(i) + facet_wrap(ANC~VERSION, scales="free")
+      show(p1)
+      show(p2)
+      show(p3)
+  }
+  dev.off()
+
+#+END_SRC
+
